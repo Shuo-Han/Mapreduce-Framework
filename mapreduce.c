@@ -8,26 +8,26 @@
 #include "mapreduce.h"
 
 #define INIT_LIST_SIZE 256
+#define NUM_NODE 10000
+#define A 70123
+#define B 76777
+#define FIRSTH 37
+
 
 #define min(a,b) \
    ({ __typeof__ (a) _a = (a); \
        __typeof__ (b) _b = (b); \
      _a < _b ? _a : _b; })
 
-// typedef struct Knode {
-//   char *value;
-//   struct Knode *next;
-// } Knode;
-
 typedef struct Knode {
   char *key;
   char *value;
 } Knode;
 
-
 typedef struct Dnode {
   char *key;
   int loc;
+  struct Dnode* next;
 } Dnode;
 
 typedef struct Mnode {
@@ -44,7 +44,10 @@ typedef struct Argpool {
 } Argpool;
 
 Knode **plist;
-Dnode **dist_key;
+Dnode ***dist_key;
+Dnode **cur_reduce;
+char ***dist_dic;
+Dnode *back;
 int *dist_len;
 int *len_list;
 int *capacity;
@@ -78,34 +81,52 @@ unsigned long MR_DefaultHashPartition(char *key, int num_partitions) {
 }
 
 void MR_Emit(char *key, char *value) {
-  Knode newnode = { .key = strdup(key), .value = strdup(value)};
+  // if (!strcmp(key, "")) return;
   unsigned long index = userpar(key, mynumpar);
+  // printf("%ld, %d\n", index, len_list[index]);
   if (capacity[index] <= len_list[index]) {
     capacity[index] *= 2;
     plist[index] = realloc(plist[index], capacity[index] * sizeof(Knode));
   }
-  plist[index][len_list[index]] = newnode;
+  plist[index][len_list[index]].key = strdup(key);
+  plist[index][len_list[index]].value = strdup(value);
   len_list[index] += 1;
 }
 
+int get_hash_code(char * s) {
+   unsigned h = FIRSTH;
+   while (*s) {
+     h = (h * A) ^ (s[0] * B);
+     s++;
+   }
+   return h % NUM_NODE;
+}
 
 char* get_next(char *key, int partition_number) {
-  static Dnode back;
+  int s = 1;
   Knode *arr = plist[partition_number];
-  if (back.key == NULL || strcmp(back.key, key)) {
-    for (size_t i = 0; i < dist_len[partition_number]; i++) {
-      if (!strcmp(key, dist_key[partition_number][i].key)) {
-        back = dist_key[partition_number][i];
+  if (back == NULL || strcmp(back->key, key)) {
+    s = 0;
+    int index = get_hash_code(key);
+    Dnode *cur = dist_key[partition_number][index];
+    while (cur) {
+      if (!strcmp(cur->key, key)) {
+        back = cur;
+        s = 1;
+        break;
       }
+      cur = cur->next;
     }
   }
 
-  if (back.loc >= len_list[partition_number]) return NULL;
-  Knode cur = arr[back.loc];
+  if (!s)
+    print_error("get_next:should not get NULL\n", 1);
+  if (back->loc >= len_list[partition_number]) return NULL;
+  Knode cur2 = arr[back->loc];
 
-  if (!strcmp(cur.key, key)) {
-    back.loc += 1;
-    return cur.value;
+  if (!strcmp(cur2.key, key)) {
+    back->loc += 1;
+    return cur2.value;
   }
 
   return NULL;
@@ -159,19 +180,63 @@ void *map_start(void *arg) {
   return NULL;
 }
 
-int get_distkey(Dnode *out, Knode *arr, int len) {
-  if (0 == len) return 0;
-  Dnode cur = {.key = strdup(arr[0].key), .loc = 0};
-  out[0] = cur;
-  int newlen = 1;
+void insert_to_hash(Dnode **tb, Dnode *newnode) {
+  int index = get_hash_code(newnode->key);
+  if (NULL == tb[index]) {
+    tb[index] = newnode;
+  } else {
+    Dnode *cur = tb[index];
+    if (!strcmp(cur->key, newnode->key) != 0)
+      print_error("insert_to_hash should not receive existing key!\n", 1);
+    while (cur->next) {
+      cur = cur->next;
+      if (!strcmp(cur->key, newnode->key) != 0)
+        print_error("insert_to_hash should not receive existing key!\n", 1);
+    }
+    cur->next = newnode;
+  }
+}
+
+void get_distkey(Dnode **out, Knode *arr, int len, int par) {
+  if (0 == len) return;
+  Dnode *cur = malloc(sizeof(Dnode));
+  cur->key = strdup(arr[0].key);
+  cur->loc = 0;
+  cur->next = NULL;
+  dist_dic[par] = malloc(sizeof(char*) * len);
+  dist_len[par] = 0;
+
+  insert_to_hash(out, cur);
+  dist_dic[par][dist_len[par]] = strdup(arr[0].key);
+  dist_len[par] = 1;
+
+  Dnode *last = cur;
   for (size_t i = 1; i < len; i++) {
-    if (strcmp(out[newlen-1].key, arr[i].key)) {
-      Dnode cur = {.key = strdup(arr[i].key), .loc = i};
-      out[newlen] = cur;
-      newlen += 1;
+    if (strcmp(last->key, arr[i].key)) {
+      cur = malloc(sizeof(Dnode));
+      cur->key = strdup(arr[i].key);
+      cur->loc = i;
+      cur->next = NULL;
+      insert_to_hash(out, cur);
+      dist_dic[par][dist_len[par]] = strdup(arr[i].key);
+      dist_len[par] += 1;
+      last = cur;
     }
   }
-  return newlen;
+}
+
+void printdist(Dnode **dist) {
+  for (size_t i = 0; i < NUM_NODE; i++) {
+    if (dist[i]) {
+        Dnode *cur = dist[i];
+        printf("%ld, %s", i, cur->key);
+        while (cur->next) {
+          cur = cur->next;
+          printf("%s ", cur->key);
+        }
+        printf("\n");
+    }
+  }
 }
 
 void *reduce_start(void *arg) {
@@ -179,14 +244,28 @@ void *reduce_start(void *arg) {
   Knode *cur = plist[p->par];
   Reducer reduce = p->reduce;
   int len = len_list[p->par];
-  dist_key[p->par] = malloc(sizeof(Dnode) * len);
-  memset(dist_key[p->par], 0, sizeof(Dnode) * len);
+  dist_key[p->par] = malloc(sizeof(Dnode*) * NUM_NODE);
+  memset(dist_key[p->par], 0, sizeof(Dnode*) * NUM_NODE);
 
-  dist_len[p->par] = get_distkey(dist_key[p->par], cur, len);
+  get_distkey(dist_key[p->par], cur, len, p->par);
+
   for (size_t i = 0; i < dist_len[p->par]; i++) {
-    pthread_mutex_lock(&mutex);
-    (*reduce)(dist_key[p->par][i].key, get_next, p->par);
-    pthread_mutex_unlock(&mutex);
+    int s = 0;
+    char *cur_key = dist_dic[p->par][i];
+    int index = get_hash_code(cur_key);
+    cur_reduce[p->par] = dist_key[p->par][index];
+    while (cur_reduce[p->par]) {
+      if (!strcmp(cur_key, cur_reduce[p->par]->key)) {
+        pthread_mutex_lock(&mutex);
+        (*reduce)(cur_reduce[p->par]->key, get_next, p->par);
+        pthread_mutex_unlock(&mutex);
+        s = 1;
+        break;
+      }
+      cur_reduce[p->par] = cur_reduce[p->par]->next;
+    }
+    if (!s)
+      print_error("reduce_start: should not be here.\n", 1);
   }
 
   return NULL;
@@ -203,12 +282,13 @@ void mapthinit(int num, Mnode **s) {
   for (size_t i = 0; i < num; i++) {
     pthread_join(thread_group[i], NULL);
   }
-
   free(thread_group);
 }
 
 void reducethinit(int num) {
   pthread_t *thread_group_r = malloc(sizeof(pthread_t) * num);
+  cur_reduce = malloc(sizeof(Dnode*) * mynumpar);
+  memset(cur_reduce, 0, sizeof(Dnode*) * mynumpar);
   Argpool args[num];
   for (size_t i = 0; i < num; i++) {
     args[i].reduce = glreduce;
@@ -219,21 +299,9 @@ void reducethinit(int num) {
   for (size_t i = 0; i < num; i++) {
     pthread_join(thread_group_r[i], NULL);
   }
+  free(cur_reduce);
+  cur_reduce = NULL;
   free(thread_group_r);
-}
-
-void free_mnode(Mnode** l, int len) {
-  Mnode *tmp, *tmp2;
-  for (size_t i = 0; i < len; i++) {
-    tmp = l[i];
-    while (tmp != NULL){
-      // free(tmp->filename);
-      tmp2 = tmp->next;
-      free(tmp);
-      tmp = tmp2;
-    }
-  }
-  free(l);
 }
 
 int compareto(const void *a, const void *b) {
@@ -242,6 +310,64 @@ int compareto(const void *a, const void *b) {
   if ( rst != 0 )
     return rst;
   return strcmp(left->value, right->value);
+}
+
+void free_mnode(Mnode** l, int len) {
+  Mnode *tmp, *tmp2;
+  for (size_t i = 0; i < len; i++) {
+    tmp = l[i];
+    while (tmp){
+      tmp2 = tmp->next;
+      free(tmp->filename);
+      free(tmp);
+      tmp = tmp2;
+    }
+  }
+  free(l);
+  l = NULL;
+}
+
+void free_all_data() {
+  for (size_t i = 0; i < mynumpar; i++) {
+    for (size_t j = 0; j < NUM_NODE; j++) {
+      Dnode *cur = dist_key[i][j], *tmp;
+      while (cur) {
+        tmp = cur->next;
+        free(cur->key);
+        free(cur);
+        cur = tmp;
+      }
+    }
+
+    for (size_t k = 0; k < dist_len[i]; k++) {
+      free(dist_dic[i][k]);
+    }
+
+    for (size_t m = 0; m < len_list[i]; m++) {
+      free(plist[i][m].key);
+      free(plist[i][m].value);
+    }
+
+    free(dist_dic[i]);
+    free(plist[i]);
+    free(dist_key[i]);
+  }
+
+
+  free(dist_dic);
+  dist_dic = NULL;
+  free(plist);
+  plist = NULL;
+  free(dist_key);
+  dist_key = NULL;
+
+  free(capacity);
+  free(len_list);
+  free(dist_len);
+  capacity = NULL;
+  len_list = NULL;
+  dist_len = NULL;
+  back = NULL;
 }
 
 void MR_Run(int argc, char *argv[], Mapper map, int num_mappers,
@@ -253,24 +379,25 @@ void MR_Run(int argc, char *argv[], Mapper map, int num_mappers,
   userpar = partition;
   mynumpar = num_reducers;
   num_mappers = min(num_mappers, argc-1);
-  dist_key = malloc(sizeof(Knode*) * mynumpar);
-  memset(dist_key, 0, sizeof(Knode*) * mynumpar);
+  dist_key = malloc(sizeof(Dnode**) * mynumpar);
+  memset(dist_key, 0, sizeof(Dnode**) * mynumpar);
   capacity = malloc(sizeof(int) * mynumpar);
   len_list = malloc(sizeof(int) * mynumpar);
   dist_len = malloc(sizeof(int) * mynumpar);
   plist = malloc(sizeof(Knode*) * mynumpar);
   memset(plist, 0, sizeof(Knode*) * mynumpar);
+  dist_dic = malloc(sizeof(char**) * mynumpar);
+  memset(dist_dic, 0, sizeof(char**) * mynumpar);
   for (size_t i = 0; i < mynumpar; i++) {
     plist[i] = malloc(sizeof(Knode) * INIT_LIST_SIZE);
+    memset(plist[i], 0, sizeof(Knode) * INIT_LIST_SIZE);
     capacity[i] = INIT_LIST_SIZE;
     len_list[i] = 0;
     dist_len[i] = 0;
   }
 
 
-  Mnode **map_par = NULL;
-  map_par = malloc(sizeof(Mnode*) * num_mappers);
-
+  Mnode **map_par = malloc(sizeof(Mnode*) * num_mappers);
   memset(map_par, 0, sizeof(Mnode*) * num_mappers);
   Mnode *filenode;
 
@@ -283,34 +410,49 @@ void MR_Run(int argc, char *argv[], Mapper map, int num_mappers,
     addtolist(map_par, map_parnum, filenode);
   }
 
-  clock_t start, end;
-  double cpu_time_used;
   pthread_mutex_init(&mutex, NULL);
   glmap = map;
 
-  start = clock();
   mapthinit(num_mappers, map_par);
-  end = clock();
 
-  cpu_time_used = ((double) (end - start)) / (CLOCKS_PER_SEC/1000);
-  printf("** %.3f ms elapsed for MAPPER **\n", cpu_time_used);
-
-  start = clock();
   for (size_t i = 0; i < mynumpar; i++) {
     qsort(plist[i], len_list[i], sizeof(Knode), compareto);
   }
-  end = clock();
 
-  cpu_time_used = ((double) (end - start)) / (CLOCKS_PER_SEC/1000);
-  printf("** %.3f ms elapsed for SORTING **\n", cpu_time_used);
+  // printer();
+
   glreduce = reduce;
-  start = clock();
   reducethinit(mynumpar);
-  end = clock();
 
-  cpu_time_used = ((double) (end - start)) / (CLOCKS_PER_SEC/1000);
-  printf("** %.3f ms elapsed for Reduce **\n", cpu_time_used);
+  free_mnode(map_par, num_mappers);
+  free_all_data();
+  // clock_t start, end;
+  // double cpu_time_used;
+  // pthread_mutex_init(&mutex, NULL);
+  // glmap = map;
   //
-  // free_mnode(map_par, num_mappers);
+  // start = clock();
+  // mapthinit(num_mappers, map_par);
+  // end = clock();
+  //
+  // cpu_time_used = ((double) (end - start)) / (CLOCKS_PER_SEC/1000);
+  // printf("** %.3f ms elapsed for MAPPER **\n", cpu_time_used);
+  //
+  // start = clock();
+  // for (size_t i = 0; i < mynumpar; i++) {
+  //   qsort(plist[i], len_list[i], sizeof(Knode), compareto);
+  // }
+  // end = clock();
+  //
+  // cpu_time_used = ((double) (end - start)) / (CLOCKS_PER_SEC/1000);
+  // printf("** %.3f ms elapsed for SORTING **\n", cpu_time_used);
+  // glreduce = reduce;
+  // start = clock();
+  // reducethinit(mynumpar);
+  // end = clock();
+  //
+  // cpu_time_used = ((double) (end - start)) / (CLOCKS_PER_SEC/1000);
+  // printf("** %.3f ms elapsed for Reduce **\n", cpu_time_used);
+  //
   // free_plist(plist, mynumpar);
 }
